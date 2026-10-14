@@ -12,11 +12,24 @@ use crate::{
 };
 use burn_backend::cubecl::dtype_to_storage_type;
 use burn_backend::{DType, Shape, TensorMetadata, ops::AttentionModuleOptions};
+use core::sync::atomic::{AtomicU64, Ordering};
 use cubecl::{calculate_cube_count_elemwise, prelude::*};
 use cubek::attention::{
     backward::{BackwardConfig, flash_attention_backward as launch_backward},
     forward::definition::{AttentionGlobalTypes, AttentionSetupError},
 };
+
+static FLASH_FWD_CALLS: AtomicU64 = AtomicU64::new(0);
+static FLASH_BWD_CALLS: AtomicU64 = AtomicU64::new(0);
+
+/// Process-wide `(forward-with-lse, backward)` launch counts of the flash training path; lets a
+/// test or bench prove autodiff took the fused node instead of `attention_fallback`.
+pub fn flash_attention_calls() -> (u64, u64) {
+    (
+        FLASH_FWD_CALLS.load(Ordering::Relaxed),
+        FLASH_BWD_CALLS.load(Ordering::Relaxed),
+    )
+}
 
 /// Typed gate for the options the flash training path implements.
 fn check(
@@ -100,6 +113,7 @@ pub fn flash_attention_lse(
     options: AttentionModuleOptions,
 ) -> Result<(CubeTensor, CubeTensor), AttentionSetupError> {
     check(&query, &key, &value, &options)?;
+    FLASH_FWD_CALLS.fetch_add(1, Ordering::Relaxed);
 
     let out = attention(
         query.clone(),
@@ -161,6 +175,7 @@ pub fn flash_attention_bwd(
     options: AttentionModuleOptions,
 ) -> Result<(CubeTensor, CubeTensor, CubeTensor), AttentionSetupError> {
     check(&query, &key, &value, &options)?;
+    FLASH_BWD_CALLS.fetch_add(1, Ordering::Relaxed);
     if lse.dtype != DType::F32 {
         return Err(AttentionSetupError::InvalidConfig(Box::new(
             "flash attention backward expects an f32 lse".to_string(),
