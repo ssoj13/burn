@@ -7,7 +7,7 @@ use crate::ops::{Backward, Ops, unary};
 use crate::tensor::AutodiffTensor;
 
 use burn_backend::TensorMetadata;
-use burn_backend::ops::attention::attention_fallback;
+use burn_backend::ops::attention::{attention_fallback, flash_bwd_supported};
 use burn_backend::ops::*;
 use burn_backend::tensor::{FloatTensor, IntTensor};
 use burn_backend::{Backend, get_or_init_device_settings};
@@ -2239,7 +2239,86 @@ impl<B: Backend, C: CheckpointStrategy> ModuleOps<Autodiff<B, C>> for Autodiff<B
         attn_bias: Option<FloatTensor<Autodiff<B, C>>>,
         options: AttentionModuleOptions,
     ) -> FloatTensor<Autodiff<B, C>> {
-        attention_fallback::<Self>(query, key, value, mask, attn_bias, options)
+        // The fused path needs a backend with a flash backward and a call it covers; everything
+        // else (mask, bias, softcap, custom scale, ...) differentiates the composed fallback.
+        if !B::has_attention_backward()
+            || !flash_bwd_supported(
+                &query.primitive.shape(),
+                &key.primitive.shape(),
+                &value.primitive.shape(),
+                mask.is_some(),
+                attn_bias.is_some(),
+                &options,
+            )
+        {
+            return attention_fallback::<Self>(query, key, value, mask, attn_bias, options);
+        }
+
+        #[derive(Debug)]
+        struct FlashAttention;
+
+        impl<B: Backend> Backward<B, 3> for FlashAttention {
+            // Q, K, V are checkpointed; the output and its log-sum-exp are saved as computed, so
+            // no `[B, H, Sq, Sk]` score matrix is ever kept or rebuilt.
+            type State = (
+                NodeId,
+                NodeId,
+                NodeId,
+                B::FloatTensorPrimitive,
+                B::FloatTensorPrimitive,
+                AttentionModuleOptions,
+            );
+
+            fn backward(
+                self,
+                ops: Ops<Self::State, 3>,
+                grads: &mut Gradients,
+                checkpointer: &mut Checkpointer,
+            ) {
+                let [node_q, node_k, node_v] = ops.parents;
+                let grad_out = grads.consume::<B>(&ops.node);
+                let (q_state, k_state, v_state, out, lse, options) = ops.state;
+                let q = checkpointer.retrieve_node_output::<B::FloatTensorPrimitive>(q_state);
+                let k = checkpointer.retrieve_node_output::<B::FloatTensorPrimitive>(k_state);
+                let v = checkpointer.retrieve_node_output::<B::FloatTensorPrimitive>(v_state);
+
+                let (dq, dk, dv) = B::attention_backward(q, k, v, out, lse, grad_out, options);
+
+                if let Some(node) = node_q {
+                    grads.register::<B>(node.id, dq);
+                }
+                if let Some(node) = node_k {
+                    grads.register::<B>(node.id, dk);
+                }
+                if let Some(node) = node_v {
+                    grads.register::<B>(node.id, dv);
+                }
+            }
+        }
+
+        match FlashAttention
+            .prepare::<C>([query.node(), key.node(), value.node()])
+            .compute_bound()
+            .stateful()
+        {
+            OpsKind::Tracked(mut prep) => {
+                let q_state = prep.checkpoint(&query);
+                let k_state = prep.checkpoint(&key);
+                let v_state = prep.checkpoint(&value);
+                let (out, lse) =
+                    B::attention_with_lse(query.primitive, key.primitive, value.primitive, options);
+                prep.finish((q_state, k_state, v_state, out.clone(), lse, options), out)
+            }
+            // Nothing to differentiate: the plain forward skips the lse pass.
+            OpsKind::UnTracked(prep) => prep.finish(B::attention(
+                query.primitive,
+                key.primitive,
+                value.primitive,
+                None,
+                None,
+                options,
+            )),
+        }
     }
 
     fn ctc_loss(

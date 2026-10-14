@@ -454,6 +454,33 @@ impl ModuleOps<Self> for CubeBackend {
         .expect("Kernel to never fail")
     }
 
+    fn has_attention_backward() -> bool {
+        true
+    }
+
+    fn attention_with_lse(
+        query: FloatTensor<Self>,
+        key: FloatTensor<Self>,
+        value: FloatTensor<Self>,
+        options: AttentionModuleOptions,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>) {
+        kernel::attention::flash_attention_lse(query, key, value, options)
+            .unwrap_or_else(|e| panic!("attention_with_lse: {e:?}"))
+    }
+
+    fn attention_backward(
+        query: FloatTensor<Self>,
+        key: FloatTensor<Self>,
+        value: FloatTensor<Self>,
+        out: FloatTensor<Self>,
+        lse: FloatTensor<Self>,
+        grad_out: FloatTensor<Self>,
+        options: AttentionModuleOptions,
+    ) -> (FloatTensor<Self>, FloatTensor<Self>, FloatTensor<Self>) {
+        kernel::attention::flash_attention_bwd(query, key, value, out, lse, grad_out, options)
+            .unwrap_or_else(|e| panic!("attention_backward: {e:?}"))
+    }
+
     fn has_ctc_loss_backward() -> bool {
         true
     }

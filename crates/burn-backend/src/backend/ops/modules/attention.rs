@@ -113,3 +113,104 @@ fn build_causal_mask<B: Backend>(attention_scores: &FloatTensor<B>) -> BoolTenso
     let mask_4d = B::bool_reshape(mask_2d, Shape::new([1, 1, seq_q, seq_k]));
     B::bool_expand(mask_4d, Shape::new([batch_size, num_heads, seq_q, seq_k]))
 }
+
+/// Whether the flash forward/backward pair ([ModuleOps::attention_with_lse],
+/// [ModuleOps::attention_backward]) covers this call: no mask, no bias, no softcap, default
+/// scale, `[B, H, S, D]` operands with equal batch/heads and `seq_q == seq_k` (so the causal
+/// triangle is unambiguous). Everything else stays on [attention_fallback].
+pub fn flash_bwd_supported(
+    query: &Shape,
+    key: &Shape,
+    value: &Shape,
+    has_mask: bool,
+    has_bias: bool,
+    options: &AttentionModuleOptions,
+) -> bool {
+    !has_mask
+        && !has_bias
+        && options.softcap.is_none()
+        && options.scale.is_none()
+        && query.num_dims() == 4
+        && key.num_dims() == 4
+        && value.num_dims() == 4
+        && query[0] == key[0]
+        && query[0] == value[0]
+        && query[1] == key[1]
+        && query[1] == value[1]
+        && query[2] == key[2]
+        && query[2] == value[2]
+        && query[3] == key[3]
+}
+
+/// Scaled, causally masked scores `scale * Q·Kᵗ` for the flash-pair defaults below.
+fn scores_for_lse<B: Backend>(
+    query: FloatTensor<B>,
+    key: FloatTensor<B>,
+    options: &AttentionModuleOptions,
+) -> FloatTensor<B> {
+    let head_dim = *query.shape().dims::<4>().last().unwrap() as f64;
+    let qk = B::float_matmul(query, B::float_transpose(key));
+    let scores = B::float_mul_scalar(qk, (1.0 / head_dim.sqrt()).into());
+    if options.is_causal {
+        let mask = build_causal_mask::<B>(&scores);
+        B::float_mask_fill(scores, mask, f32::NEG_INFINITY.into())
+    } else {
+        scores
+    }
+}
+
+/// Composed-ops [ModuleOps::attention_with_lse]: materialises the scores once, with no autodiff
+/// graph attached. Correct on every backend; native backends override it with a flash kernel.
+pub fn attention_with_lse_default<B: Backend>(
+    query: FloatTensor<B>,
+    key: FloatTensor<B>,
+    value: FloatTensor<B>,
+    options: AttentionModuleOptions,
+) -> (FloatTensor<B>, FloatTensor<B>) {
+    let [batch, heads, seq_q, _] = query.shape().dims::<4>();
+    let scores = scores_for_lse::<B>(query, key, &options);
+    let finfo = scores.dtype().finfo().expect("float tensor");
+
+    // lse = m + ln(sum(exp(s - m))), with m clamped so fully masked rows stay NaN-free.
+    let max = B::float_clamp_min(B::float_max_dim(scores.clone(), 3), finfo.min.into());
+    let exp = B::float_exp(B::float_sub(scores, max.clone()));
+    let sum = B::float_sum_dim(exp.clone(), 3);
+    let lse = B::float_add(max, B::float_log(sum.clone()));
+
+    let probs = B::float_div(exp, B::float_clamp_min(sum, finfo.min_positive.into()));
+    let out = B::float_matmul(probs, value);
+    let lse = B::float_reshape(lse, Shape::new([batch, heads, seq_q]));
+    (out, B::float_cast(lse, burn_std::FloatDType::F32))
+}
+
+/// Composed-ops [ModuleOps::attention_backward]: rebuilds `P = exp(S - lse)` from `lse`
+/// (transiently materialised) and applies the softmax Jacobian with `D = rowsum(dO ⊙ O)`.
+pub fn attention_backward_default<B: Backend>(
+    query: FloatTensor<B>,
+    key: FloatTensor<B>,
+    value: FloatTensor<B>,
+    out: FloatTensor<B>,
+    lse: FloatTensor<B>,
+    grad_out: FloatTensor<B>,
+    options: AttentionModuleOptions,
+) -> (FloatTensor<B>, FloatTensor<B>, FloatTensor<B>) {
+    let [batch, heads, seq_q, head_dim] = query.shape().dims::<4>();
+    let scale = 1.0 / (head_dim as f64).sqrt();
+    let float_dtype = burn_std::FloatDType::from(query.dtype());
+
+    let scores = scores_for_lse::<B>(query.clone(), key.clone(), &options);
+    let lse = B::float_reshape(
+        B::float_cast(lse, float_dtype),
+        Shape::new([batch, heads, seq_q, 1]),
+    );
+    let probs = B::float_exp(B::float_sub(scores, lse));
+
+    let d = B::float_sum_dim(B::float_mul(grad_out.clone(), out), 3);
+    let dp = B::float_matmul(grad_out.clone(), B::float_transpose(value));
+    let ds = B::float_mul(probs.clone(), B::float_sub(dp, d));
+
+    let dv = B::float_matmul(B::float_transpose(probs), grad_out);
+    let dq = B::float_mul_scalar(B::float_matmul(ds.clone(), key), scale.into());
+    let dk = B::float_mul_scalar(B::float_matmul(B::float_transpose(ds), query), scale.into());
+    (dq, dk, dv)
+}

@@ -1,4 +1,4 @@
-use super::{conv, ctc, linear, pool};
+use super::{attention, conv, ctc, linear, pool};
 use crate::ops::unfold::{create_unfolding_weight, unfold4d_using_conv2d};
 use crate::tensor::{BoolTensor, FloatTensor, IntTensor};
 use crate::{Backend, Scalar, TensorMetadata};
@@ -1045,6 +1045,47 @@ pub trait ModuleOps<B: Backend> {
         attn_bias: Option<FloatTensor<B>>,
         options: AttentionModuleOptions,
     ) -> FloatTensor<B>;
+
+    /// Returns `true` if autodiff may record one fused node for `attention` calls that pass
+    /// `flash_bwd_supported`, built on [attention_with_lse](ModuleOps::attention_with_lse) and
+    /// [attention_backward](ModuleOps::attention_backward). Both have composed-ops defaults that
+    /// are correct everywhere; only backends overriding them with flash kernels avoid the
+    /// `[B, H, Sq, Sk]` score matrix. Other calls keep the composed fallback.
+    fn has_attention_backward() -> bool {
+        false
+    }
+
+    /// Flash attention forward that also returns the per-row log-sum-exp.
+    ///
+    /// Same arguments as [attention](ModuleOps::attention) without `mask`/`attn_bias`; `options`
+    /// must satisfy `flash_bwd_supported` (autodiff checks first; backends reject anything else).
+    ///
+    /// # Returns
+    /// `(out, lse)`: `out` is `[batch, heads, seq_q, val_dim]` in the query dtype; `lse` is
+    /// `[batch, heads, seq_q]` f32, `m + ln(sum(exp(s - m)))` over the scaled (and causally masked)
+    /// scores, natural log.
+    fn attention_with_lse(
+        query: FloatTensor<B>,
+        key: FloatTensor<B>,
+        value: FloatTensor<B>,
+        options: AttentionModuleOptions,
+    ) -> (FloatTensor<B>, FloatTensor<B>) {
+        attention::attention_with_lse_default::<B>(query, key, value, options)
+    }
+
+    /// Flash attention backward from the forward's `out` and `lse`: `(dq, dk, dv)`, each shaped and
+    /// typed like its primal. Only called when [has_attention_backward](ModuleOps::has_attention_backward).
+    fn attention_backward(
+        query: FloatTensor<B>,
+        key: FloatTensor<B>,
+        value: FloatTensor<B>,
+        out: FloatTensor<B>,
+        lse: FloatTensor<B>,
+        grad_out: FloatTensor<B>,
+        options: AttentionModuleOptions,
+    ) -> (FloatTensor<B>, FloatTensor<B>, FloatTensor<B>) {
+        attention::attention_backward_default::<B>(query, key, value, out, lse, grad_out, options)
+    }
 
     /// Applies Layer Normalization over the last dimension of the input tensor.
     ///

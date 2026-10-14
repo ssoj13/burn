@@ -105,3 +105,66 @@ fn attention_grads_match_composed_ops() {
         }
     }
 }
+
+/// Square, maskless, default-scale attention takes the fused flash forward/backward on backends
+/// that have one (`has_attention_backward`); gradients must match the composed ops that
+/// materialise the score matrix. Larger than the test above so several tiles are exercised.
+#[test]
+fn flash_attention_grads_match_composed_ops() {
+    let device = AutodiffDevice::new();
+    let (b, h, s, e) = (2, 4, 64, 64);
+    let random = || TestTensor::<4>::random([b, h, s, e], Distribution::Default, &device).into_data();
+    let (q_data, k_data, v_data) = (random(), random(), random());
+    let causal_data = TensorData::new(
+        (0..s * s).map(|i| i % s > i / s).collect::<Vec<_>>(),
+        [1, 1, s, s],
+    );
+
+    for is_causal in [false, true] {
+        let run = |composed: bool| {
+            let q = TestTensor::<4>::from_data(q_data.clone(), &device).require_grad();
+            let k = TestTensor::<4>::from_data(k_data.clone(), &device).require_grad();
+            let v = TestTensor::<4>::from_data(v_data.clone(), &device).require_grad();
+
+            let output = if composed {
+                let mut scores = q
+                    .clone()
+                    .matmul(k.clone().swap_dims(2, 3))
+                    .mul_scalar(1.0 / (e as f64).sqrt());
+                if is_causal {
+                    let causal = Tensor::<4, Bool>::from_data(causal_data.clone(), &device)
+                        .expand([b, h, s, s]);
+                    scores = scores.mask_fill(causal, f32::NEG_INFINITY);
+                }
+                softmax(scores, 3).matmul(v.clone())
+            } else {
+                let options = AttentionModuleOptions {
+                    scale: None,
+                    softcap: None,
+                    is_causal,
+                };
+                attention(q.clone(), k.clone(), v.clone(), None, None, options)
+            };
+
+            let weights = TensorData::new(
+                (0..output.shape().num_elements())
+                    .map(|i| (i % 7) as f32 - 3.0)
+                    .collect::<Vec<_>>(),
+                output.shape(),
+            );
+            let grads = (output.clone() * TestTensor::from_data(weights, &device))
+                .sum()
+                .backward();
+            [
+                output.into_data(),
+                q.grad(&grads).unwrap().into_data(),
+                k.grad(&grads).unwrap().into_data(),
+                v.grad(&grads).unwrap().into_data(),
+            ]
+        };
+
+        for (actual, expected) in run(false).into_iter().zip(run(true)) {
+            actual.assert_approx_eq::<FloatElem>(&expected, Tolerance::permissive());
+        }
+    }
+}
