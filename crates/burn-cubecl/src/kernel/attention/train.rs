@@ -8,7 +8,7 @@
 
 use super::{AttentionStrategy, attention};
 use crate::{
-    kernel::into_contiguous, ops::numeric::empty_device_dtype, tensor::CubeTensor,
+    kernel::into_contiguous, ops::numeric::empty_device_contiguous_dtype, tensor::CubeTensor,
 };
 use burn_backend::cubecl::dtype_to_storage_type;
 use burn_backend::{DType, Shape, TensorMetadata, ops::AttentionModuleOptions};
@@ -30,6 +30,10 @@ pub fn flash_attention_calls() -> (u64, u64) {
         FLASH_BWD_CALLS.load(Ordering::Relaxed),
     )
 }
+
+// The kernels below index outputs as dense `row * head_dim`, so every output buffer is allocated
+// with `empty_device_contiguous_dtype`: `empty_device_dtype` may row-pitch small last dims
+// (e.g. bf16 d=4), which would leave the written data misaligned with the tensor's strides.
 
 /// Typed gate for the options the flash training path implements.
 fn check(
@@ -129,7 +133,7 @@ pub fn flash_attention_lse(
     let query = into_contiguous(query);
     let key = into_contiguous(key);
     let [b, h, sq, d] = query.shape().dims::<4>();
-    let lse = empty_device_dtype(
+    let lse = empty_device_contiguous_dtype(
         query.client.clone(),
         query.device.clone(),
         Shape::new([b, h, sq]),
@@ -185,9 +189,9 @@ pub fn flash_attention_bwd(
     let client = query.client.clone();
     let [query, key, value, out, lse, grad_out] =
         [query, key, value, out, lse, grad_out].map(into_contiguous);
-    let dq = empty_device_dtype(client.clone(), query.device.clone(), query.shape(), query.dtype);
-    let dk = empty_device_dtype(client.clone(), key.device.clone(), key.shape(), key.dtype);
-    let dv = empty_device_dtype(client.clone(), value.device.clone(), value.shape(), value.dtype);
+    let dq = empty_device_contiguous_dtype(client.clone(), query.device.clone(), query.shape(), query.dtype);
+    let dk = empty_device_contiguous_dtype(client.clone(), key.device.clone(), key.shape(), key.dtype);
+    let dv = empty_device_contiguous_dtype(client.clone(), value.device.clone(), value.shape(), value.dtype);
 
     let float = dtype_to_storage_type(query.dtype);
     let dtypes = AttentionGlobalTypes {
