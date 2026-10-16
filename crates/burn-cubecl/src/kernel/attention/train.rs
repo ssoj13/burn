@@ -219,6 +219,193 @@ fn attention_lse_tiled_kernel<E: Float, F: Float>(
     }
 }
 
+#[cube(launch, address_type = "dynamic")]
+fn attention_lse_wmma_kernel<E: Float, F: Float>(
+    q: &Tensor<E>,
+    k: &Tensor<E>,
+    lse: &mut Tensor<F>,
+    scale: f32,
+    #[comptime] head_dim: usize,
+    #[comptime] causal: bool,
+    #[define(E, F)] _dtypes: [ElemType; 2],
+) {
+    let num_d_tiles = comptime!(head_dim / 16);
+    let k_sh_len = comptime!(16 * head_dim);
+    let warp_sh_len = comptime!(4 * 256usize);
+
+    let seq_q = q.shape(q.rank() - 2);
+    let seq_kv = k.shape(k.rank() - 2);
+    let total_q_rows = lse.len();
+    let total_bh = total_q_rows / seq_q;
+    let q_tiles_per_bh = seq_q.div_ceil(64);
+
+    let cube_id = CUBE_POS;
+    let bh = cube_id / q_tiles_per_bh;
+    if bh >= total_bh {
+        terminate!();
+    }
+
+    let q_tile_idx = cube_id % q_tiles_per_bh;
+    let cta_q_base = q_tile_idx * 64;
+    let w = UNIT_POS_Y as usize;
+    let lane = UNIT_POS_X as usize;
+    let tid = w * 32 + lane;
+    let warp_q_base = cta_q_base + w * 16;
+    let w_off = w * 256;
+    let w_end = w_off + 256;
+
+    let q_bh_base = bh * seq_q * head_dim;
+    let k_bh_base = bh * seq_kv * head_dim;
+    let row_bh_base = bh * seq_q;
+
+    let mut k_sh = Shared::<[E]>::new_aligned_slice(k_sh_len, 16usize);
+    let mut q_stage_sh = Shared::<[E]>::new_aligned_slice(warp_sh_len, 16usize);
+    let mut s_sh = Shared::<[F]>::new_aligned_slice(warp_sh_len, 16usize);
+
+    let mut q_frags = Sequence::<cmma::Matrix<E>>::new();
+
+    #[unroll]
+    for d_blk in 0..num_d_tiles {
+        let d_off = d_blk * 16;
+        #[unroll]
+        for step in 0..8usize {
+            let idx = lane + step * 32;
+            let r = idx / 16;
+            let c = idx % 16;
+            let q_idx = warp_q_base + r;
+            let d_idx = d_off + c;
+            if q_idx < seq_q && d_idx < head_dim {
+                q_stage_sh[w_off + idx] = q[q_bh_base + q_idx * head_dim + d_idx];
+            } else {
+                q_stage_sh[w_off + idx] = E::cast_from(0.0_f32);
+            }
+        }
+        sync_plane();
+        let q_frag = cmma::Matrix::<E>::from_slice(
+            cmma::MatrixIdent::A,
+            16usize,
+            16usize,
+            16usize,
+            cmma::MatrixLayout::RowMajor,
+            &q_stage_sh[w_off..w_end],
+            16u32,
+        );
+        q_frags.push(q_frag);
+        sync_plane();
+    }
+
+    let cta_q_end = if seq_q < cta_q_base + 64 {
+        seq_q
+    } else {
+        cta_q_base + 64
+    };
+    let cta_q_max = cta_q_end - 1;
+    let max_kv = if causal {
+        if cta_q_max + seq_kv < seq_q {
+            0usize
+        } else {
+            let lim = cta_q_max + seq_kv + 1 - seq_q;
+            if seq_kv < lim { seq_kv } else { lim }
+        }
+    } else {
+        seq_kv
+    };
+
+    let scale_f = F::cast_from(scale);
+    let mut m = F::new(-1.0e30_f32);
+    let mut l = F::new(0.0_f32);
+
+    let mut kv_base = 0usize;
+    while kv_base < max_kv {
+        #[unroll]
+        for d_blk in 0..num_d_tiles {
+            let blk_off = d_blk * 256;
+            let d_off = d_blk * 16;
+            #[unroll]
+            for s in 0..2usize {
+                let elem = tid + s * 128;
+                let r = elem / 16;
+                let c = elem % 16;
+                let kv_idx = kv_base + r;
+                let d_idx = d_off + c;
+                if kv_idx < seq_kv && d_idx < head_dim {
+                    k_sh[blk_off + elem] = k[k_bh_base + kv_idx * head_dim + d_idx];
+                } else {
+                    k_sh[blk_off + elem] = E::cast_from(0.0_f32);
+                }
+            }
+        }
+
+        sync_cube();
+
+        if warp_q_base < seq_q {
+            let warp_q_max = warp_q_base + 15;
+            let warp_active = !causal || (kv_base + seq_q <= warp_q_max + seq_kv);
+            if warp_active {
+                let s_frag = cmma::Matrix::<F>::from_value(
+                    cmma::MatrixIdent::Accumulator,
+                    16usize,
+                    16usize,
+                    16usize,
+                    cmma::MatrixLayout::Undefined,
+                    F::new(0.0_f32),
+                );
+                #[unroll]
+                for d_blk in 0..num_d_tiles {
+                    let b_start = d_blk * 256;
+                    let b_end = b_start + 256;
+                    let k_col = cmma::Matrix::<E>::from_slice(
+                        cmma::MatrixIdent::B,
+                        16usize,
+                        16usize,
+                        16usize,
+                        cmma::MatrixLayout::ColMajor,
+                        &k_sh[b_start..b_end],
+                        16u32,
+                    );
+                    cmma::execute(&q_frags[d_blk], &k_col, &s_frag, &s_frag);
+                }
+                cmma::store(
+                    &mut s_sh[w_off..w_end],
+                    &s_frag,
+                    16u32,
+                    cmma::MatrixLayout::RowMajor,
+                );
+                sync_plane();
+
+                if lane < 16 {
+                    let r = lane;
+                    let i = warp_q_base + r;
+                    if i < seq_q {
+                        let r_off = w_off + r * 16;
+                        #[unroll]
+                        for c in 0..16usize {
+                            let j = kv_base + c;
+                            let masked = j >= seq_kv || (causal && j + seq_q > i + seq_kv);
+                            if !masked {
+                                let s = s_sh[r_off + c] * scale_f;
+                                let m_new = if s > m { s } else { m };
+                                l = l * (m - m_new).exp() + (s - m_new).exp();
+                                m = m_new;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        sync_cube();
+        kv_base += 16;
+    }
+
+    if lane < 16 {
+        let i = warp_q_base + lane;
+        if i < seq_q {
+            lse[row_bh_base + i] = m + l.ln();
+        }
+    }
+}
+
 /// Flash forward returning `(out, lse)`; `out` is the regular [`attention`] result (same strategy
 /// selection, autotune included), `lse` is `[B, H, Sq]` f32.
 pub fn flash_attention_lse(
@@ -259,7 +446,50 @@ pub fn flash_attention_lse(
     let dtypes = [dtype_to_storage_type(query.dtype), dtype_to_storage_type(DType::F32)];
     let scale = (d as f32).sqrt().recip();
 
-    if client.properties().hardware.plane_size_max == 32 && d <= 128 {
+    let elem_ty = dtypes[0];
+    let has_wmma_16 = client
+        .properties()
+        .features
+        .matmul
+        .cmma
+        .contains(&cubecl::ir::features::MmaConfig {
+            a_type: elem_ty,
+            b_type: elem_ty,
+            cd_type: dtypes[1],
+            m: 16,
+            k: 16,
+            n: 16,
+        });
+
+    if client.properties().hardware.plane_size_max == 32
+        && has_wmma_16
+        && d > 0
+        && d <= 128
+        && d % 16 == 0
+    {
+        let total_bh = b * h;
+        let q_tiles_per_bh = sq.div_ceil(64);
+        let num_cubes = total_bh * q_tiles_per_bh;
+        let cube_dim = CubeDim::new_2d(32, 4);
+        let cube_count = calculate_cube_count_elemwise(
+            &client,
+            num_cubes * (cube_dim.num_elems() as usize),
+            cube_dim,
+        );
+        attention_lse_wmma_kernel::launch(
+            &client,
+            cube_count,
+            cube_dim,
+            address_type,
+            query.into_tensor_arg(),
+            key.into_tensor_arg(),
+            lse.clone().into_tensor_arg(),
+            scale,
+            d,
+            options.is_causal,
+            dtypes,
+        );
+    } else if client.properties().hardware.plane_size_max == 32 && d <= 128 {
         let total_bh = b * h;
         let q_tiles_per_bh = sq.div_ceil(4);
         let num_cubes = total_bh * q_tiles_per_bh;
