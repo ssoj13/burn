@@ -108,6 +108,117 @@ fn attention_lse_kernel<E: Float, F: Float>(
     lse[row] = m + l.ln();
 }
 
+#[cube(launch, address_type = "dynamic")]
+fn attention_lse_tiled_kernel<E: Float, F: Float>(
+    q: &Tensor<E>,
+    k: &Tensor<E>,
+    lse: &mut Tensor<F>,
+    scale: f32,
+    #[comptime] head_dim: usize,
+    #[comptime] causal: bool,
+    #[define(E, F)] _dtypes: [ElemType; 2],
+) {
+    let c_d = comptime!(head_dim.div_ceil(32));
+    let k_sh_len = comptime!(32 * head_dim);
+
+    let seq_q = q.shape(q.rank() - 2);
+    let seq_kv = k.shape(k.rank() - 2);
+    let total_q_rows = lse.len();
+    let total_bh = total_q_rows / seq_q;
+    let q_tiles_per_bh = seq_q.div_ceil(4);
+
+    let cube_id = CUBE_POS;
+    let bh = cube_id / q_tiles_per_bh;
+    if bh >= total_bh {
+        terminate!();
+    }
+
+    let q_tile_idx = cube_id % q_tiles_per_bh;
+    let i_base = q_tile_idx * 4;
+    let w = UNIT_POS_Y as usize;
+    let lane = UNIT_POS_X as usize;
+    let tid = w * 32 + lane;
+
+    let i = i_base + w;
+    let valid_i = i < seq_q;
+    let row_idx = bh * seq_q + i;
+    let q_base = row_idx * head_dim;
+    let k_bh_base = bh * seq_kv * head_dim;
+
+    let mut q_reg = Array::<F>::new(c_d);
+    let scale_f = F::cast_from(scale);
+    #[unroll]
+    for c in 0..c_d {
+        let dd = c * 32 + lane;
+        if valid_i && dd < head_dim {
+            q_reg[c] = F::cast_from(q[q_base + dd]) * scale_f;
+        } else {
+            q_reg[c] = F::new(0.0_f32);
+        }
+    }
+
+    let i_end = if seq_q < i_base + 4 { seq_q } else { i_base + 4 };
+    let i_max = i_end - 1;
+    let max_kv = if causal {
+        if i_max + seq_kv < seq_q {
+            0usize
+        } else {
+            let lim = i_max + seq_kv + 1 - seq_q;
+            if seq_kv < lim { seq_kv } else { lim }
+        }
+    } else {
+        seq_kv
+    };
+
+    let mut k_sh = Shared::<[F]>::new_slice(k_sh_len);
+    let mut m = F::new(-1.0e30_f32);
+    let mut l = F::new(0.0_f32);
+
+    let mut j_tile = 0usize;
+    while j_tile < max_kv {
+        let rem = max_kv - j_tile;
+        let tile_rows = if rem < 32usize { rem } else { 32usize };
+        let k_tile_base = k_bh_base + j_tile * head_dim;
+        let k_elems = tile_rows * head_dim;
+        let mut idx = tid;
+        while idx < k_elems {
+            k_sh[idx] = F::cast_from(k[k_tile_base + idx]);
+            idx += 128;
+        }
+
+        sync_cube();
+
+        if valid_i {
+            for t in 0..tile_rows {
+                let j = j_tile + t;
+                let masked = causal && j + seq_q > i + seq_kv;
+                if !masked {
+                    let k_off = t * head_dim;
+                    let mut dot_part = F::new(0.0_f32);
+                    #[unroll]
+                    for c in 0..c_d {
+                        let dd = c * 32 + lane;
+                        if dd < head_dim {
+                            dot_part += q_reg[c] * k_sh[k_off + dd];
+                        }
+                    }
+                    let s = plane_sum(dot_part);
+                    let m_new = if s > m { s } else { m };
+                    l = l * (m - m_new).exp() + (s - m_new).exp();
+                    m = m_new;
+                }
+            }
+        }
+
+        sync_cube();
+        j_tile += 32;
+    }
+
+    if valid_i && lane == 0 {
+        lse[row_idx] = m + l.ln();
+    }
+}
+
 /// Flash forward returning `(out, lse)`; `out` is the regular [`attention`] result (same strategy
 /// selection, autotune included), `lse` is `[B, H, Sq]` f32.
 pub fn flash_attention_lse(
@@ -140,28 +251,55 @@ pub fn flash_attention_lse(
         DType::F32,
     );
 
-    let units = b * h * sq;
     let client = query.client.clone();
-    let cube_dim = CubeDim::new(&client, units);
-    let cube_count = calculate_cube_count_elemwise(&client, units, cube_dim);
     let address_type = query
         .required_address_type()
         .max(key.required_address_type())
         .max(lse.required_address_type());
     let dtypes = [dtype_to_storage_type(query.dtype), dtype_to_storage_type(DType::F32)];
-    attention_lse_kernel::launch(
-        &client,
-        cube_count,
-        cube_dim,
-        address_type,
-        query.into_tensor_arg(),
-        key.into_tensor_arg(),
-        lse.clone().into_tensor_arg(),
-        (d as f32).sqrt().recip(),
-        d,
-        options.is_causal,
-        dtypes,
-    );
+    let scale = (d as f32).sqrt().recip();
+
+    if client.properties().hardware.plane_size_max == 32 && d <= 128 {
+        let total_bh = b * h;
+        let q_tiles_per_bh = sq.div_ceil(4);
+        let num_cubes = total_bh * q_tiles_per_bh;
+        let cube_dim = CubeDim::new_2d(32, 4);
+        let cube_count = calculate_cube_count_elemwise(
+            &client,
+            num_cubes * (cube_dim.num_elems() as usize),
+            cube_dim,
+        );
+        attention_lse_tiled_kernel::launch(
+            &client,
+            cube_count,
+            cube_dim,
+            address_type,
+            query.into_tensor_arg(),
+            key.into_tensor_arg(),
+            lse.clone().into_tensor_arg(),
+            scale,
+            d,
+            options.is_causal,
+            dtypes,
+        );
+    } else {
+        let units = b * h * sq;
+        let cube_dim = CubeDim::new(&client, units);
+        let cube_count = calculate_cube_count_elemwise(&client, units, cube_dim);
+        attention_lse_kernel::launch(
+            &client,
+            cube_count,
+            cube_dim,
+            address_type,
+            query.into_tensor_arg(),
+            key.into_tensor_arg(),
+            lse.clone().into_tensor_arg(),
+            scale,
+            d,
+            options.is_causal,
+            dtypes,
+        );
+    }
 
     Ok((out, lse))
 }
