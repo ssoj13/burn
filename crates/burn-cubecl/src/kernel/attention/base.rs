@@ -69,6 +69,17 @@ pub fn attention(
         }
         #[cfg(feature = "autotune")]
         AttentionStrategy::Autotune => {
+            if mask.is_none()
+                && attn_bias.is_none()
+                && let Ok((out, _)) = super::train::launch_flash_fwd_lse(
+                    query.clone(),
+                    key.clone(),
+                    value.clone(),
+                    options,
+                )
+            {
+                return Ok(out);
+            }
             return Ok(attention_autotune(
                 query, key, value, mask, attn_bias, options,
             ));
