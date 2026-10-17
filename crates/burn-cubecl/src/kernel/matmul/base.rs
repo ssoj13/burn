@@ -54,21 +54,30 @@ fn maybe_dequantize(tensor: CubeTensor, dtype: DType) -> CubeTensor {
     }
 }
 
-fn classify_matrix_2d(rows: usize, cols: usize, sr: usize, sc: usize) -> Option<(GemmTranspose, i32)> {
+fn classify_matrix_2d(
+    rows: usize,
+    cols: usize,
+    sr: usize,
+    sc: usize,
+) -> Option<(GemmTranspose, i32)> {
     if sc == 1 && (rows <= 1 || sr >= cols) {
         let ld = if rows <= 1 {
             cols.max(1)
         } else {
             sr.max(cols).max(1)
         };
-        i32::try_from(ld).ok().map(|ld| (GemmTranspose::NonTranspose, ld))
+        i32::try_from(ld)
+            .ok()
+            .map(|ld| (GemmTranspose::NonTranspose, ld))
     } else if sr == 1 && (cols <= 1 || sc >= rows) {
         let ld = if cols <= 1 {
             rows.max(1)
         } else {
             sc.max(rows).max(1)
         };
-        i32::try_from(ld).ok().map(|ld| (GemmTranspose::Transpose, ld))
+        i32::try_from(ld)
+            .ok()
+            .map(|ld| (GemmTranspose::Transpose, ld))
     } else {
         None
     }
@@ -79,7 +88,11 @@ fn try_launch_vendor_gemm(
     mut rhs: CubeTensor,
     out: &CubeTensor,
 ) -> Option<()> {
-    if !out.client.has_gemm() || lhs.qparams.is_some() || rhs.qparams.is_some() {
+    if lhs.qparams.is_some() || rhs.qparams.is_some() {
+        return None;
+    }
+    let backend = super::native::gemm_backend();
+    if backend == super::native::GemmBackend::CuBlas && !out.client.has_gemm() {
         return None;
     }
     if lhs.dtype != rhs.dtype || lhs.dtype != out.dtype {
@@ -123,7 +136,7 @@ fn try_launch_vendor_gemm(
     })
     .ok()?;
 
-    // Ensure lhs and rhs have a cuBLAS-compatible 2D layout (either OP_N or OP_T);
+    // Ensure lhs and rhs have a 2D GEMM layout (either OP_N or OP_T);
     // if not, materialize only the non-conforming operand as contiguous.
     if classify_matrix_2d(
         m_row,
@@ -158,6 +171,23 @@ fn try_launch_vendor_gemm(
         lhs.meta.strides()[rank - 2],
         lhs.meta.strides()[rank - 1],
     )?;
+
+    if backend == super::native::GemmBackend::Native {
+        return super::native::launch_native_gemm(
+            lhs,
+            rhs,
+            out,
+            elem_ty,
+            m_row,
+            n_row,
+            k_row,
+            ldb as usize,
+            lda as usize,
+            ldc as usize,
+            transb,
+            transa,
+        );
+    }
 
     let m = i32::try_from(n_row).ok()?;
     let n = i32::try_from(m_row).ok()?;
@@ -243,6 +273,7 @@ fn try_launch_vendor_gemm(
         batch_count,
         outer_offsets,
     });
+    super::native::record_cublas_call();
     Some(())
 }
 
